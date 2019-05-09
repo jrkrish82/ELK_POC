@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:si-xml="http://www.springframework.org/schema/integration/xml"
+	xmlns:jms="http://www.springframework.org/schema/integration/jms"
+	xmlns:si="http://www.springframework.org/schema/integration" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:util="http://www.springframework.org/schema/util"
+	xmlns:file="http://www.springframework.org/schema/integration/file"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans
+			http://www.springframework.org/schema/beans/spring-beans.xsd
+			http://www.springframework.org/schema/integration
+			http://www.springframework.org/schema/integration/spring-integration.xsd
+			http://www.springframework.org/schema/integration/jms 
+			http://www.springframework.org/schema/integration/jms/spring-integration-jms.xsd
+			http://www.springframework.org/schema/integration/xml
+			http://www.springframework.org/schema/integration/xml/spring-integration-xml.xsd
+			http://www.springframework.org/schema/util
+			http://www.springframework.org/schema/util/spring-util.xsd
+			http://www.springframework.org/schema/integration/file
+			http://www.springframework.org/schema/integration/file/spring-integration-file.xsd">
+
+
+
+	<bean id="handler" class="io.sample.service.file.FileHandler"></bean>
+	<bean id="xmlToDocServiceImpl" class="io.sample.service.XmltoDocServiceImpl"></bean>
+	<bean id="warehouseDispatch" class="io.sample.service.WarehouseDispatch" />
+	
+	<!-- Global logging interceptor -->
+	<!-- <si:channel-interceptor pattern="*Channel" order="3">
+		<si:wire-tap channel="logger" />
+	</si:channel-interceptor>
+	
+	<si:logging-channel-adapter level="DEBUG" log-full-message="true" channel="logger" /> -->
+
+	<si:channel id="logger"/>	
+	<si:channel id="internChannel"/>
+	<si:channel id="filesIn"/>
+	<si:channel id="filesOut"/>
+	<si:channel id="accountChannel"/>
+	<si:channel id="ordersChannel"/>
+	<si:channel id="xmlChannel"/>
+	<si:channel id="contentChannel" />
+	<si:channel id="stockCheckerChannel" />
+	<si:channel id="orderRoutingChannel" />
+	<si:channel id="warehouseDispatchChannel"/>
+	<si:channel id="outOfStockChannel"/>
+	<si:channel id="resupplyOrderChannel"/>
+
+	<jms:outbound-channel-adapter id="fileOut" destination="inJMSQueue" channel="filesOut" connection-factory="jmsConnectionFactory"/>
+	<jms:message-driven-channel-adapter id="inJMSAdapater" destination="inJMSQueue" connection-factory="jmsConnectionFactory" channel="xmlChannel"/>
+	<jms:outbound-channel-adapter id="jmsOut" destination="errJMSQueue" channel="contentChannel" connection-factory="jmsConnectionFactory"/> 
+	<jms:outbound-channel-adapter id="wareHouseDsp" destination="outJMSQueue" channel="warehouseDispatchChannel" connection-factory="jmsConnectionFactory"/> 
+	<jms:outbound-channel-adapter id="orderResupply" destination="backJMSQueue" channel="resupplyOrderChannel" connection-factory="jmsConnectionFactory"/> 
+	
+	<file:inbound-channel-adapter directory="${inbound.folder}" channel="filesIn" filename-pattern="*.*">
+	  <si:poller id="poller" fixed-delay="5000"/>
+	</file:inbound-channel-adapter>
+   
+   <si:service-activator input-channel="filesIn" output-channel="filesOut" ref="handler"/>
+   <si:service-activator id="xmlToDocService" input-channel="xmlChannel" ref="xmlToDocServiceImpl" method="convert" output-channel="ordersChannel"/>
+  
+    
+   <si-xml:validating-filter id="schemaValidator" output-channel="ordersChannel" throw-exception-on-rejection="true" 
+				schema-location="classpath:/order.xsd" 	input-channel="contentChannel"	discard-channel="accountChannel"/>
+				
+	<!-- map of namespace prefix to URI -->
+	<util:map id="orderNamespaceMap">
+		<entry key="orderNs" value="http://www.example.org/orders" />
+		<entry key="productNs" value="http://www.example.org/prodcuts" />
+	</util:map>
+
+	<!-- split the inbound order into a number of orderItem documents that can be processed separately -->
+	<si-xml:xpath-splitter id="orderItemSplitter" input-channel="ordersChannel" output-channel="stockCheckerChannel" create-documents="true">
+		<si-xml:xpath-expression expression="/orderNs:order/orderNs:orderItem" namespace-map="orderNamespaceMap" />
+	</si-xml:xpath-splitter>
+
+	<!-- if each order -->
+	<si:service-activator input-channel="stockCheckerChannel" output-channel="orderRoutingChannel">
+		<bean class="io.sample.service.StockChecker">
+			<constructor-arg ref="selectIsbnXpath" />
+		</bean>
+	</si:service-activator>
+
+	<si-xml:xpath-expression id="selectIsbnXpath" namespace-map="orderNamespaceMap" expression="/orderNs:orderItem/orderNs:isbn/text()" />
+
+	<!-- if in stock route to the warehouse else route to the out of stock channel -->
+	<si-xml:xpath-router id="instockRouter" input-channel="orderRoutingChannel" resolution-required="true">
+		<si-xml:xpath-expression expression="/orderNs:orderItem/@in-stock" namespace-map="orderNamespaceMap"  />
+		<si-xml:mapping value="true" channel="warehouseDispatchChannel"/>
+		<si-xml:mapping value="false" channel="outOfStockChannel"/>
+	</si-xml:xpath-router>
+	
+	<!--  dispatch order if in stock -->
+	<si:outbound-channel-adapter method="dispatch" channel="warehouseDispatchChannel">
+		<bean class="io.sample.service.WarehouseDispatch" />
+	</si:outbound-channel-adapter>
+
+	<!--  convert the order item to a format that can be understood by BigBooks the wholesaler -->
+	<si-xml:xslt-transformer input-channel="outOfStockChannel" output-channel="resupplyOrderChannel" 
+			xsl-resource="classpath:/META-INF/spring/integration/bigBooksSupplierTransformer.xsl"/>
+
+	<!-- send the resupply order -->
+	<si:outbound-channel-adapter method="orderResupply" channel="resupplyOrderChannel">
+		<bean class="io.sample.service.ExternalResupply" />
+	</si:outbound-channel-adapter>
+</beans>
